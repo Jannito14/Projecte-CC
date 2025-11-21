@@ -1,0 +1,397 @@
+# =========================
+# 💻 INTERFAZ GROUND STATION (Tkinter) - V2.5 with ORBIT + CHECKSUM handling
+# =========================
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinter import *
+from tkinter import messagebox
+import math
+import time
+
+# =================== Configuración puerto ===================
+device = 'COM5'   # AJUSTA AQUÍ si tu puerto es distinto
+mySerial = serial.Serial(device, 9600, timeout=1)
+
+# =================== Variables de datos ===================
+temperaturas = []
+humedades = []
+eje_x = []
+media_movil = []
+
+alerta_activa = False
+alerta_media_activa = False
+limite_temp = 30.0
+ventana_default = 10
+i = 0
+lectura_activa = False
+
+radar_angulos = []
+radar_distancias = []
+RADAR_MAX_POINTS = 3
+
+modo_media = "python"
+
+# -------------------------
+# 🟢 NUEVO ORBITA: variables
+# -------------------------
+orbit_x = []
+orbit_y = []
+R_EARTH = 6371000  # metros
+orbit_plot = None
+last_point_plot = None
+earth_circle = None
+orbit_xlim = 7e6
+orbit_ylim = 7e6
+
+# =================== Ventana principal ===================
+window = Tk()
+window.title("Ground Station - Radar + Gráficas + Órbita (v2.5 + CHECKSUM)")
+window.geometry("1600x900")
+
+# =================== Figuras ===================
+fig = plt.figure(figsize=(12,9))
+ax1 = fig.add_subplot(3, 2, 1)
+ax2 = fig.add_subplot(3, 2, 3)
+ax3 = fig.add_subplot(3, 2, 5)
+ax_radar = fig.add_subplot(3, 2, 2, polar=True)
+ax_orbit = fig.add_subplot(3, 2, 6)
+
+line_temp, = ax1.plot([], [], '-', color='red', label="Temperatura")
+ax1.set_title("Temperatura (°C)"); ax1.grid(True); ax1.legend()
+line_hum, = ax2.plot([], [], '-', color='blue', label="Humedad")
+ax2.set_title("Humedad (%)"); ax2.grid(True); ax2.legend()
+line_avg, = ax3.plot([], [], '-', color='green', label="Media móvil")
+ax3.set_title("Media móvil"); ax3.grid(True); ax3.legend()
+
+ax_radar.set_theta_zero_location('N'); ax_radar.set_theta_direction(-1); ax_radar.set_rlim(0,400)
+ax_radar.set_thetamin(0); ax_radar.set_thetamax(180)
+
+# órbita: línea y punto
+orbit_plot, = ax_orbit.plot([], [], 'b-', linewidth=1, label='Órbita')
+last_point_plot = ax_orbit.scatter([], [], color='red', s=40, label='Posición actual')
+earth_circle = plt.Circle((0, 0), R_EARTH, color='orange', fill=False, label='Tierra')
+ax_orbit.add_artist(earth_circle)
+ax_orbit.set_xlim(-orbit_xlim, orbit_xlim); ax_orbit.set_ylim(-orbit_ylim, orbit_ylim)
+ax_orbit.set_aspect('equal', 'box'); ax_orbit.set_xlabel('X (m)'); ax_orbit.set_ylabel('Y (m)')
+ax_orbit.set_title('Órbita ecuatorial (vista desde polo norte)'); ax_orbit.grid(True); ax_orbit.legend(loc='upper right')
+
+canvas = FigureCanvasTkAgg(fig, master=window)
+canvas.draw()
+canvas.get_tk_widget().grid(row=0, column=0, rowspan=30, padx=10, pady=10)
+
+# =================== Panel de controles (igual que antes) ===================
+controls_frame = Frame(window)
+controls_frame.grid(row=0, column=1, sticky=N, padx=12)
+
+Label(controls_frame, text="Ground Station v2.5", font=("Courier", 18, "italic")).grid(row=0, column=0, pady=(0,10))
+Label(controls_frame, text="Límite temperatura (°C):").grid(row=1, column=0, sticky=W)
+limiteVar = StringVar(value=str(limite_temp))
+Entry(controls_frame, textvariable=limiteVar, width=10).grid(row=2,column=0, sticky=W)
+
+Label(controls_frame, text="Ventana media móvil (N):").grid(row=3,column=0, sticky=W)
+ventanaVar = IntVar(value=ventana_default)
+Spinbox(controls_frame, from_=1, to=200, textvariable=ventanaVar, width=6).grid(row=4,column=0, sticky=W)
+
+Label(controls_frame, text="Intervalo envío DHT (s):").grid(row=5,column=0, sticky=W, pady=(6,0))
+intervaloDHTVar = IntVar(value=3)
+Spinbox(controls_frame, from_=1, to=3600, textvariable=intervaloDHTVar, width=6).grid(row=6,column=0, sticky=W)
+
+def send_intervalo_dht():
+    try:
+        s = int(intervaloDHTVar.get())
+        mySerial.write(f"1:{s}\n".encode())  # La estación añade checksum antes de reenviar
+        print("Enviado intervalo DHT:", s)
+    except:
+        messagebox.showerror("Error", "Intervalo DHT inválido")
+
+Button(controls_frame, text="Enviar intervalo DHT", command=send_intervalo_dht, width=18).grid(row=7,column=0,pady=(4,8))
+
+Label(controls_frame, text="Intervalo ultrasonidos (ms):").grid(row=8,column=0, sticky=W)
+intervaloUltraVar = IntVar(value=500)
+Spinbox(controls_frame, from_=50, to=10000, textvariable=intervaloUltraVar, width=8).grid(row=9,column=0, sticky=W)
+
+def send_intervalo_ultra():
+    try:
+        ms = int(intervaloUltraVar.get())
+        mySerial.write(f"7:{ms}\n".encode())
+        print("Enviado intervalo ultrasonidos (ms):", ms)
+    except:
+        messagebox.showerror("Error", "Intervalo ultrasonidos inválido")
+
+Button(controls_frame, text="Enviar intervalo ultrasonidos", command=send_intervalo_ultra, width=18).grid(row=10,column=0,pady=(4,8))
+
+Label(controls_frame, text="Dónde calcular la media:").grid(row=11,column=0, sticky=W)
+modoVar = StringVar(value="python")
+
+def modo_media_changed():
+    global modo_media
+    modo_media = modoVar.get()
+    if modo_media == "arduino":
+        mySerial.write(b"8:1\n")
+        time.sleep(0.05)
+        n = int(ventanaVar.get())
+        mySerial.write(f"9:{n}\n".encode())
+        print("Modo media: ARDUINO, window N sent:", n)
+    else:
+        mySerial.write(b"8:0\n")
+        print("Modo media: PYTHON")
+
+Radiobutton(controls_frame, text="Python (local)", variable=modoVar, value="python", command=modo_media_changed).grid(row=12,column=0, sticky=W)
+Radiobutton(controls_frame, text="Arduino (remoto)", variable=modoVar, value="arduino", command=modo_media_changed).grid(row=13,column=0, sticky=W)
+
+Label(controls_frame, text="Ángulo servo (0-180°):").grid(row=14,column=0, sticky=W, pady=(8,0))
+anguloVar = IntVar(value=0)
+Entry(controls_frame, textvariable=anguloVar, width=6).grid(row=15,column=0, sticky=W)
+
+def enviar_angulo():
+    try:
+        ang = int(anguloVar.get())
+        if 0 <= ang <= 180:
+            mySerial.write(f"2:{ang}\n".encode())
+            print("Enviado ángulo:", ang)
+        else:
+            messagebox.showerror("Error", "Ángulo debe estar entre 0 y 180")
+    except:
+        messagebox.showerror("Error", "Ángulo inválido")
+
+Button(controls_frame, text="Enviar ángulo", command=enviar_angulo, width=18, bg='cyan').grid(row=16,column=0,pady=(4,6))
+
+def activar_barrido():
+    try: mySerial.write(b"6:1\n")
+    except: pass
+def desactivar_barrido():
+    try: mySerial.write(b"6:0\n")
+    except: pass
+
+Button(controls_frame, text="Activar Barrido", command=activar_barrido, width=18, bg='green').grid(row=17,column=0,pady=3)
+Button(controls_frame, text="Detener Barrido", command=desactivar_barrido, width=18, bg='red').grid(row=18,column=0,pady=3)
+
+# Controles órbita: activar/desactivar simulador en satélite (comando 11)
+Label(controls_frame, text="Simulador órbita (satélite):").grid(row=19, column=0, sticky=W, pady=(8,0))
+def orbit_on():
+    try: mySerial.write(b"11:1\n")
+    except: pass
+def orbit_off():
+    try: mySerial.write(b"11:0\n")
+    except: pass
+Button(controls_frame, text="Activar órbita", command=orbit_on, width=18).grid(row=20,column=0,pady=2)
+Button(controls_frame, text="Desactivar órbita", command=orbit_off, width=18).grid(row=21,column=0,pady=2)
+
+# Toggle corruption testing on satellite (12:1 / 12:0)
+Label(controls_frame, text="Testing: Corrupt mensajes:").grid(row=22, column=0, sticky=W, pady=(6,0))
+def corrupt_on(): 
+    try: mySerial.write(b"12:1\n")
+    except: pass
+def corrupt_off():
+    try: mySerial.write(b"12:0\n")
+    except: pass
+Button(controls_frame, text="Corrupt ON", command=corrupt_on, width=18, bg='orange').grid(row=23,column=0,pady=2)
+Button(controls_frame, text="Corrupt OFF", command=corrupt_off, width=18, bg='lightgray').grid(row=24,column=0,pady=2)
+
+Label(controls_frame, text="Estado alarma (medias):").grid(row=25, column=0, sticky=W, pady=(8,0))
+alarma_media_label = Label(controls_frame, text="Normal", bg="lightgreen", width=18)
+alarma_media_label.grid(row=26, column=0, pady=(2,8))
+
+def IniciarClick():
+    global lectura_activa
+    lectura_activa = True
+    try: mySerial.write(b'Iniciar\n')
+    except: pass
+    ciclo_lectura()
+
+def PararClick():
+    global lectura_activa
+    lectura_activa = False
+    try: mySerial.write(b'Parar\n')
+    except: pass
+
+def ReanudarClick():
+    global lectura_activa
+    lectura_activa = True
+    try: mySerial.write(b'Iniciar\n')
+    except: pass
+    ciclo_lectura()
+
+def ResetClick():
+    global temperaturas, humedades, eje_x, media_movil, i, radar_angulos, radar_distancias, orbit_x, orbit_y, alerta_activa, alerta_media_activa
+    temperaturas=[]; humedades=[]; eje_x=[]; media_movil=[]; i=0
+    radar_angulos=[]; radar_distancias=[]
+    orbit_x=[]; orbit_y=[]
+    alerta_activa=False; alerta_media_activa=False
+    alarma_media_label.config(text="Normal", bg="lightgreen")
+    try: mySerial.write(b'6:1\n')
+    except: pass
+    actualizar_graficas()
+
+Button(controls_frame, text="Iniciar", bg='green', fg='white', command=IniciarClick, width=18).grid(row=27,column=0,pady=(8,2))
+Button(controls_frame, text="Parar", bg='red', fg='white', command=PararClick, width=18).grid(row=28,column=0,pady=2)
+Button(controls_frame, text="Reanudar", bg='yellow', fg='black', command=ReanudarClick, width=18).grid(row=29,column=0,pady=2)
+Button(controls_frame, text="Reset (reactiva barrido)", bg='gray', fg='white', command=ResetClick, width=18).grid(row=30,column=0,pady=(6,2))
+
+# =================== Funciones de graficado ===================
+def actualizar_graficas():
+    line_temp.set_data(eje_x, temperaturas)
+    line_hum.set_data(eje_x, humedades)
+
+    if modoVar.get() == "python":
+        N = max(1, int(ventanaVar.get()))
+        media_movil.clear()
+        for idx in range(len(temperaturas)):
+            slice_ = temperaturas[max(0, idx - N + 1): idx + 1]
+            media_movil.append(sum(slice_) / len(slice_))
+
+    media_plot = [m if (m is not None and not (isinstance(m, float) and math.isnan(m))) else 0 for m in media_movil]
+    line_avg.set_data(eje_x[:len(media_plot)], media_plot)
+
+    ax1.relim(); ax1.autoscale_view()
+    ax2.relim(); ax2.autoscale_view()
+    ax3.relim(); ax3.autoscale_view()
+
+    # Radar
+    ax_radar.clear()
+    ax_radar.set_theta_zero_location('N'); ax_radar.set_theta_direction(-1)
+    ax_radar.set_rlim(0,400); ax_radar.set_thetamin(0); ax_radar.set_thetamax(180)
+    ax_radar.set_title("Radar ultrasónico (últimos 3 puntos)")
+    if radar_angulos:
+        theta = [math.radians(a) for a in radar_angulos]
+        r = radar_distancias
+        for idx_pt in range(len(theta)):
+            if idx_pt == len(theta)-1:
+                ax_radar.scatter([theta[idx_pt]], [r[idx_pt]], c='red', s=140, zorder=4, edgecolors='k')
+            else:
+                ax_radar.scatter([theta[idx_pt]], [r[idx_pt]], c='orange', s=80, zorder=3, edgecolors='k')
+        ax_radar.plot(theta, r, color='orange', linewidth=1, zorder=2)
+
+    # Órbita
+    if orbit_x:
+        orbit_plot.set_data(orbit_x, orbit_y)
+        last_point_plot.set_offsets([[orbit_x[-1], orbit_y[-1]]])
+        cur_xlim = ax_orbit.get_xlim(); cur_ylim = ax_orbit.get_ylim()
+        max_abs = max(abs(orbit_x[-1]), abs(orbit_y[-1]), abs(cur_xlim[0]), abs(cur_xlim[1]), abs(cur_ylim[0]), abs(cur_ylim[1]))
+        if max_abs > cur_xlim[1]*0.9:
+            new_lim = max_abs * 1.2
+            ax_orbit.set_xlim(-new_lim, new_lim)
+            ax_orbit.set_ylim(-new_lim, new_lim)
+
+    canvas.draw_idle()
+
+# =================== Lectura serie ===================
+def leer_serial():
+    global i, alerta_activa, alerta_media_activa, limite_temp
+    try:
+        while mySerial.in_waiting > 0:
+            line = mySerial.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+            print("Serie <-", line)
+
+            # 🔵 NUEVO CHECKSUM: la Estación Tierra ya valida checksum y reenvía payload limpio.
+            # Por tanto aquí recibimos payloads del tipo original (sin *CS), excepto mensajes de error: "ERR:CHECKSUM"
+            if line.startswith("ERR:CHECKSUM"):
+                messagebox.showerror("Comunicación", "Mensaje corrupto recibido (checksum inválido)")
+                continue
+
+            trozos = line.split(':')
+
+            # --- POSICIÓN ORBITAL: 10:time:x:y:z ---
+            if trozos[0] == '10' and len(trozos) >= 5:
+                try:
+                    t_orb = float(trozos[1])
+                    x = float(trozos[2]); y = float(trozos[3]); z = float(trozos[4])
+                except:
+                    continue
+                orbit_x.append(x); orbit_y.append(y)
+                if len(orbit_x) > 5000: orbit_x.pop(0); orbit_y.pop(0)
+                actualizar_graficas()
+                continue
+
+            # --- DHT: 1:<temp>:<hum>[:A:<avg>] ---
+            if len(trozos) >= 3 and trozos[0] == '1':
+                try:
+                    temperatura = float(trozos[1]); hum = float(trozos[2])
+                except:
+                    continue
+                eje_x.append(i); temperaturas.append(temperatura); humedades.append(hum); i += 1
+
+                if modoVar.get() == "arduino":
+                    if len(trozos) >= 5 and trozos[3] == 'A':
+                        try:
+                            avg = float(trozos[4]); media_movil.append(avg)
+                        except:
+                            N = max(1, int(ventanaVar.get()))
+                            if len(temperaturas) >= N: media_movil.append(sum(temperaturas[-N:]) / N)
+                            else: media_movil.append(float('nan'))
+                    else:
+                        N = max(1, int(ventanaVar.get()))
+                        if len(temperaturas) >= N: media_movil.append(sum(temperaturas[-N:]) / N)
+                        else: media_movil.append(float('nan'))
+                else:
+                    N = max(1, int(ventanaVar.get()))
+                    if len(temperaturas) >= N: media_movil.append(sum(temperaturas[-N:]) / N)
+                    else: media_movil.append(float('nan'))
+
+                # alertas temperatura
+                if len(temperaturas) >= 3:
+                    ult3 = temperaturas[-3:]
+                    try: limite = float(limiteVar.get())
+                    except: limite = limite_temp
+                    if all(x > limite for x in ult3) and not alerta_activa:
+                        alerta_activa = True; messagebox.showwarning("Alerta", f"Las 3 últimas temperaturas superan {limite} °C")
+                    elif not all(x > limite for x in ult3) and alerta_activa:
+                        alerta_activa = False
+
+                # alertas medias
+                medias_validas = [m for m in media_movil if (m is not None and not (isinstance(m, float) and math.isnan(m)))]
+                if len(medias_validas) >= 3:
+                    last3_medias = medias_validas[-3:]
+                    try: limite = float(limiteVar.get())
+                    except: limite = limite_temp
+                    if all(m > limite for m in last3_medias):
+                        if not alerta_media_activa:
+                            alerta_media_activa = True
+                            alarma_media_label.config(text="Peligro", bg="red")
+                            messagebox.showwarning("Alerta MEDIA", f"Las 3 últimas MEDIAS superan {limite} °C")
+                    else:
+                        if alerta_media_activa:
+                            alerta_media_activa = False
+                            alarma_media_label.config(text="Normal", bg="lightgreen")
+
+            elif len(trozos) >= 3 and trozos[0] == '2':
+                try:
+                    ang = float(trozos[1]); dist = float(trozos[2])
+                except:
+                    continue
+                if ang < 0 or ang > 180: continue
+                radar_angulos.append(ang); radar_distancias.append(dist)
+                while len(radar_angulos) > RADAR_MAX_POINTS:
+                    radar_angulos.pop(0); radar_distancias.pop(0)
+            else:
+                if trozos[0] == '3':
+                    print("Satélite: fallo DHT")
+                elif trozos[0] == '5':
+                    print("Satélite msg:", ":".join(trozos[1:]))
+                elif trozos[0] == '6':
+                    print("Satélite: fallo sensor distancia")
+                else:
+                    print("Otro mensaje:", line)
+
+            actualizar_graficas()
+
+    except serial.SerialException as e:
+        print("Error puerto serie:", e)
+
+def ciclo_lectura():
+    if lectura_activa:
+        leer_serial()
+        window.after(200, ciclo_lectura)
+
+def on_close():
+    global lectura_activa
+    lectura_activa = False
+    try: mySerial.close()
+    except: pass
+    window.destroy()
+
+window.protocol("WM_DELETE_WINDOW", on_close)
+window.mainloop()
