@@ -1,61 +1,92 @@
+// =======================
+// 🏠 ARDUINO ESTACIÓN DE TIERRA - V2.6
+// Reenvío entre satélite (SoftwareSerial) y PC (Serial USB) + verificación checksum
+// =======================
+
 #include <SoftwareSerial.h>
 
-SoftwareSerial mySerial(10, 11);
+// Comunicación con satélite (SoftwareSerial)
+SoftwareSerial satSerial(10, 11); // RX, TX hacia satélite
 
-const int ledDatos = 12;
-const int ledFalloDHT = 13;
-// ⭐️ NUEVO 5.3 ⭐️ LED adicional para fallo del sensor de distancia
-const int ledFalloDistancia = 8;
+const int ledRx = 12;     // LED que parpadea al recibir datos
+const int ledAlerta = 13; // LED de alerta (fallo sensor o checksum)
 
 unsigned long ultimoMensaje = 0;
-const unsigned long timeout = 5000;
+const unsigned long timeout = 5000; // 5 segundos sin mensaje -> alerta
+
+// 🔵 NUEVO CHECKSUM: función para calcular checksum
+byte calcularChecksum(String mensaje) { // 🔵 NUEVO CHECKSUM
+  byte suma = 0;
+  for (int i = 0; i < mensaje.length(); ++i) suma += (byte)mensaje[i];
+  return suma;
+}
+
+// 🔵 NUEVO CHECKSUM: validar mensaje con formato PAYLOAD*CS
+// Si OK -> devuelve true y pone payloadOut sin el CS
+bool validarMensajeConChecksum(String linea, String &payloadOut) { // 🔵 NUEVO CHECKSUM
+  linea.trim();
+  int sep = linea.lastIndexOf('*');
+  if (sep == -1) return false;
+  payloadOut = linea.substring(0, sep);
+  String csStr = linea.substring(sep + 1);
+  byte csRec = (byte)csStr.toInt();
+  byte csCalc = calcularChecksum(payloadOut);
+  return (csRec == csCalc);
+}
 
 void setup() {
-  pinMode(ledDatos, OUTPUT);
-  pinMode(ledFalloDHT, OUTPUT);
-  pinMode(ledFalloDistancia, OUTPUT); // ⭐️ NUEVO 5.3 ⭐️
+  pinMode(ledRx, OUTPUT);
+  pinMode(ledAlerta, OUTPUT);
+
   Serial.begin(9600);
-  mySerial.begin(9600);
+  satSerial.begin(9600);
+
+  Serial.println("Estación de Tierra lista");
   ultimoMensaje = millis();
 }
 
 void loop() {
-  if (mySerial.available()) {
-    String data = mySerial.readStringUntil('\n');
-    data.trim();
-    Serial.println(data);
+  // 1️⃣ Recepción de datos del satélite (con checksum) ---------------------
+  if (satSerial.available()) {
+    String line = satSerial.readStringUntil('\n');
+    line.trim();
     ultimoMensaje = millis();
 
-    digitalWrite(ledDatos, HIGH);
-    delay(100);
-    digitalWrite(ledDatos, LOW);
+    digitalWrite(ledRx, HIGH);
+    delay(50);
+    digitalWrite(ledRx, LOW);
 
-    int fin = data.indexOf(':');
-    if (fin > 0) {
-      int codigo = data.substring(0, fin).toInt();
-      String valor = data.substring(fin + 1);
-
-      if (codigo == 3) { // fallo DHT
-        digitalWrite(ledFalloDHT, HIGH);
-      } 
-      else if (codigo == 6) { // ⭐️ NUEVO 5.3 ⭐️ fallo sensor distancia
-        digitalWrite(ledFalloDistancia, HIGH);
-        Serial.println("⚠️  Fallo del sensor de distancia");
-      } 
-      else {
-        digitalWrite(ledFalloDHT, LOW);
-        digitalWrite(ledFalloDistancia, LOW);
-      }
+    String payload;
+    // 🔵 NUEVO CHECKSUM: validar antes de reenviar al PC
+    if (validarMensajeConChecksum(line, payload)) {
+      // ✅ Checksum correcto -> reenviamos SOLO el payload (sin *CS) al PC
+      digitalWrite(ledAlerta, LOW);
+      Serial.println(payload); // ❗ mantenemos formato antiguo para compatibilidad Python
+    } else {
+      // ❗ Checksum inválido -> descartar y encender alerta
+      digitalWrite(ledAlerta, HIGH);
+      Serial.println("ERR:CHECKSUM"); // para depuración en Python
+      // opcional: podríamos solicitar retransmisión (no implementado)
     }
   }
 
+  // 2️⃣ Timeout sin comunicación
   if (millis() - ultimoMensaje > timeout) {
-    digitalWrite(ledFalloDistancia, HIGH);
-    Serial.println("⚠️  Sin comunicación con el satélite");
+    digitalWrite(ledAlerta, HIGH);
+    Serial.println("⚠️ Sin comunicación con el satélite");
   }
 
+  // 3️⃣ Reenvío de comandos desde interfaz hacia el satélite (añadir checksum)
   if (Serial.available()) {
-    String data = Serial.readStringUntil('\n');
-    mySerial.println(data);
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.length() > 0) {
+      // 🔵 NUEVO CHECKSUM: calcular CS e insertar "cmd*CS"
+      byte cs = calcularChecksum(cmd);
+      String toSend = cmd + "*" + String(cs);
+      satSerial.println(toSend);
+      // opcional: eco para la interfaz (confirmación)
+      Serial.println("SENT_TO_SAT:" + toSend);
+    }
   }
 }
